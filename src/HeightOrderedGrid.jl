@@ -39,7 +39,7 @@ function HOGrid{T}(points::Vector{SVector{3,T}}, gridspacing)
 
     grid = Matrix{Vector{SVector{3,T}}}((n_x, n_y))
     for i = 1:n_x
-        for j = 1:n_x
+        for j = 1:n_y
             grid[i,j] = Vector{SVector{3,T}}() # Should this be done sparsely?
         end
     end
@@ -62,6 +62,246 @@ function HOGrid{T}(points::Vector{SVector{3,T}}, gridspacing)
 
     return HOGrid(grid, xmin, ymin, gridspacing)
 end
+
+
+immutable SpatialQuery{T}
+    grid::HOGrid{T}
+    query_point::SVector{3,T}
+    radius::T
+    gx_min::Int
+    gx_max::Int
+    gy_min::Int
+    gy_max::Int
+end
+
+function SpatialQuery{T}(grid::HOGrid{T}, query_point::SVector{3,T}, radius::T)
+    r² = radius * radius
+
+    @inbounds qx = query_point[1]
+    @inbounds qy = query_point[2]
+
+    # Make a square cutoff
+    xmin = qx - radius
+    xmax = qx + radius
+    ymin = qy - radius
+    ymax = qy + radius
+
+    # Make a square grid
+    gx_min = Int(cld(xmin - grid.x0, grid.spacing))
+    if gx_min < 1
+        gx_min = 1
+    end
+    gx_max = Int(cld(xmax - grid.x0, grid.spacing))
+    if gx_max > size(grid.grid, 1)
+        gx_max = size(grid.grid, 1)
+    end
+
+    gy_min = Int(cld(ymin - grid.y0, grid.spacing))
+    if gy_min < 1
+        gy_min = 1
+    end
+    gy_max = Int(cld(ymax - grid.y0, grid.spacing))
+    if gy_max > size(grid.grid, 2)
+        gy_max = size(grid.grid, 2)
+    end
+
+    return SpatialQuery(grid, query_point, radius, gx_min, gx_max, gy_min, gy_max)
+end
+
+@inline height{T <: Number}(p::SVector{3,T}) = @inbounds return p[3]
+@inline height{T <: Number}(h::T) = h
+
+function Base.start{T}(sq::SpatialQuery{T})
+    gx = sq.gx_min
+    gy = sq.gy_min
+    r² = sq.radius * sq.radius
+
+    @inbounds qx = sq.query_point[1]
+    @inbounds qy = sq.query_point[2]
+    @inbounds qz = sq.query_point[3]
+
+    while true
+        if gy > sq.gy_max
+            break
+        end
+
+        # Fit a sphere and find the vertical range to query, if any
+        if qy > sq.grid.y0 + gy * sq.grid.spacing
+            dy = qy - (sq.grid.y0 + gy * sq.grid.spacing)
+        elseif qy >= sq.grid.y0 + (gy - 1) * sq.grid.spacing
+            dy = zero(T)
+        else
+            dy = (sq.grid.y0 + (gy - 1) * sq.grid.spacing) - qy
+        end
+
+        while true
+            if gx > sq.gx_max
+                gx = sq.gx_min
+                break
+            end
+
+            # Fit a sphere and find the vertical range to query, if any
+            if qx > sq.grid.x0 + gx * sq.grid.spacing
+                dx = qx - (sq.grid.x0 + gx * sq.grid.spacing)
+            elseif qx >= sq.grid.x0 + (gx - 1) * sq.grid.spacing
+                dx = zero(T)
+            else
+                dx = (sq.grid.x0 + (gx - 1) * sq.grid.spacing) - qx
+            end
+
+            h² = dx*dx + dy*dy
+            if h² > r²
+                gx += 1
+                continue
+            end
+            dz = sqrt(r² - h²)
+
+            # Now find the first element in this range
+            @inbounds cell = sq.grid.grid[gx, gy]
+            i = searchsortedfirst(cell, qz - dz, Base.By(height))
+
+            # Now loop until we find one
+            while true
+                if i > size(cell, 1)
+                    break
+                end
+
+                @inbounds p = cell[i]
+                diff = p - sq.query_point
+                if dot(diff, diff) <= r²
+                    return (gx, gy, i, dz)
+                end
+
+                if height(p) - qz > dz
+                    break
+                end
+
+                i += 1
+            end
+
+            gx += 1
+        end
+
+        gy += 1
+    end
+
+    return (gx, gy, i, dz)
+end
+
+
+function Base.next{T}(sq::SpatialQuery{T}, state::Tuple{Int,Int,Int,T})
+    (gx, gy, i, dz) = state
+    r² = sq.radius * sq.radius
+    @inbounds qx = sq.query_point[1]
+    @inbounds qy = sq.query_point[2]
+    @inbounds qz = sq.query_point[3]
+
+    # If we are calling next, then gx, gy, i is a valid state
+    @inbounds cell = sq.grid.grid[gx, gy]
+    @inbounds p_now = cell[i]
+
+    # increment i and check the same cell before continuing
+    while true
+        i += 1
+
+        if i > size(cell, 1)
+            break
+        end
+
+        @inbounds p = cell[i]
+        diff = p - sq.query_point
+        if dot(diff, diff) <= r²
+            return (p_now, (gx, gy, i, dz))
+        end
+
+        if height(p) - qz > dz
+            break
+        end
+    end
+
+    # increment gx and check other cells
+    gx += 1
+
+    while true
+        if gy > sq.gy_max
+            break
+        end
+
+        # Fit a sphere and find the vertical range to query, if any
+        if qy > sq.grid.y0 + gy * sq.grid.spacing
+            dy = qy - (sq.grid.y0 + gy * sq.grid.spacing)
+        elseif qy >= sq.grid.y0 + (gy - 1) * sq.grid.spacing
+            dy = zero(T)
+        else
+            dy = (sq.grid.y0 + (gy - 1) * sq.grid.spacing) - qy
+        end
+
+        while true
+            if gx > sq.gx_max
+                gx = sq.gx_min
+                break
+            end
+
+            # Fit a sphere and find the vertical range to query, if any
+            if qx > sq.grid.x0 + gx * sq.grid.spacing
+                dx = qx - (sq.grid.x0 + gx * sq.grid.spacing)
+            elseif qx >= sq.grid.x0 + (gx - 1) * sq.grid.spacing
+                dx = zero(T)
+            else
+                dx = (sq.grid.x0 + (gx - 1) * sq.grid.spacing) - qx
+            end
+
+            h² = dx*dx + dy*dy
+            if h² > r²
+                gx += 1
+                continue
+            end
+            dz = sqrt(r² - h²)
+
+            # Now find the first element in this range
+            @inbounds cell = sq.grid.grid[gx, gy]
+            i = searchsortedfirst(cell, qz - dz, Base.By(height))
+
+            # Now loop until we find one
+            while true
+                if i > size(cell, 1)
+                    break
+                end
+
+                @inbounds p = cell[i]
+                diff = p - sq.query_point
+                if dot(diff, diff) <= r²
+                    return (p_now, (gx, gy, i, dz))
+                end
+
+                if height(p) - qz > dz
+                    break
+                end
+
+                i += 1
+            end
+
+            gx += 1
+        end
+
+        gy += 1
+    end
+
+    return (p_now, (gx, gy, i, dz))
+end
+
+Base.done{T}(sq::SpatialQuery{T}, state::Tuple{Int,Int,Int,T}) = state[2] > sq.gy_max
+
+
+
+
+
+
+
+
+
+
+
 
 immutable SpatialIterator{T, ZMin, ZMax}
     grid_cells::Vector{Vector{SVector{3,T}}}
@@ -161,8 +401,12 @@ end
     g = 1
     @inbounds cell = si.grid_cells[g]
     @inbounds dz = si.dz[g]
-    i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz); by = p -> p[3]) # by is applied to comparitor as well... (???)
-    r² = si.radius^2
+    # Interesting new (undocumented) interface to sorting in Julia Base:
+    # Note that the old method is currently not type stable in Julia 0.5 and
+    # results in a noticeable slowdown of the entire algorithm!
+    #i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz); by = p -> p[3]) # by is applied to comparitor as well... (???)
+    i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz), Base.By(p -> p[3]))
+    r² = si.radius * si.radius
 
     while true # Loop over g
         while true # Loop over i
@@ -189,7 +433,8 @@ end
         else
             @inbounds cell = si.grid_cells[g]
             @inbounds dz = si.dz[g]
-            i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz); by = p -> p[3]) # by is applied to comparitor as well... (???)
+            #i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz); by = p -> p[3]) # by is applied to comparitor as well... (???)
+            i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz), Base.By(p -> p[3]))
         end
     end
 end
@@ -198,7 +443,7 @@ end
 @inline function getnext{T}(g::Int, i::Int, si::SpatialIterator{T, Void, Void})
     @inbounds cell = si.grid_cells[g]
     i += 1
-    r² = si.radius^2
+    r² = si.radius * si.radius
     @inbounds dz = si.dz[g]
 
 
@@ -228,7 +473,8 @@ end
         else
             @inbounds cell = si.grid_cells[g]
             @inbounds dz = si.dz[g]
-            i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz); by = p -> p[3]) # by is applied to comparitor as well... (???)
+            #i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz); by = p -> p[3]) # by is applied to comparitor as well... (???)
+            i = searchsortedfirst(cell, si.query_point - SVector(0.0, 0.0, dz), Base.By(p -> p[3]))
         end
     end
 end

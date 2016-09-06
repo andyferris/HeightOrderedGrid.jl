@@ -1,0 +1,64 @@
+    while true
+        if gy > sq.gy_max
+            break
+        end
+
+        # Fit a sphere and find the vertical range to query, if any
+        if qy > sq.grid.y0 + gy * sq.grid.spacing
+            dy = qy - (sq.grid.y0 + gy * sq.grid.spacing)
+        elseif qy >= sq.grid.y0 + (gy - 1) * sq.grid.spacing
+            dy = zero(T)
+        else
+            dy = (sq.grid.y0 + (gy - 1) * sq.grid.spacing) - qy
+        end
+
+        while true
+            if gx > sq.gx_max
+                gx = sq.gx_min
+                break
+            end
+
+            # Fit a sphere and find the vertical range to query, if any
+            if qx > sq.grid.x0 + gx * sq.grid.spacing
+                dx = qx - (sq.grid.x0 + gx * sq.grid.spacing)
+            elseif qx >= sq.grid.x0 + (gx - 1) * sq.grid.spacing
+                dx = zero(T)
+            else
+                dx = (sq.grid.x0 + (gx - 1) * sq.grid.spacing) - qx
+            end
+
+            h² = dx*dx + dy*dy
+            if h² > r²
+                gx += 1
+                continue
+            end
+            dz = sqrt(r² - h²)
+
+            # Now find the first element in this range
+            @inbounds cell = sq.grid.grid[gx, gy]
+            i = searchsortedfirst(cell, qz - dz, Base.By(height))
+
+            # Now loop until we find one
+            while true
+                if i > size(cell, 1)
+                    break
+                end
+
+                @inbounds p = cell[i]
+                diff = p - sq.query_point
+                if dot(diff, diff) <= r²
+                    return (gx, gy, i, dz)
+                end
+
+                if height(p) - qz > dz
+                    break
+                end
+
+                i += 1
+            end
+
+            gx += 1
+        end
+
+        gy += 1
+    end
